@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Camera,
   Download,
@@ -25,7 +25,8 @@ import {
 import { useApp } from '../../context/AppContext';
 import { ScreenId } from '../../types';
 import {
-  AXON_INTERFACES,
+  discoverAvailableInterfaces,
+  getAllInterfaces,
   InterfaceMetadata,
   getInterfaceById,
   getSafeInterfaceFileName,
@@ -33,6 +34,8 @@ import {
 import {
   captureLiveCurrentInterface,
   captureInterfaceById,
+  captureLiveInterfaceWithPanels,
+  captureInterfaceByIdWithPanels,
   captureAllInterfaces,
   stitchCanvasesVertically,
   exportCapturesToPdf,
@@ -68,8 +71,15 @@ export const InterfaceCaptureScreen: React.FC = () => {
   const [searchFilter, setSearchFilter] = useState<string>('');
   const resultsSectionRef = useRef<HTMLDivElement>(null);
 
+  // Dynamic interface discovery
+  const [availableInterfaces, setAvailableInterfaces] = useState<InterfaceMetadata[]>(() => getAllInterfaces());
+
+  useEffect(() => {
+    setAvailableInterfaces(discoverAvailableInterfaces());
+  }, []);
+
   // Determine current screen name
-  const currentMeta = getInterfaceById(previousScreen && previousScreen !== 'tool_interface_capture' ? previousScreen : currentScreen) || AXON_INTERFACES[0];
+  const currentMeta = getInterfaceById(previousScreen && previousScreen !== 'tool_interface_capture' ? previousScreen : currentScreen) || availableInterfaces[0];
 
   const handleToggleMultipleId = (id: string) => {
     setSelectedMultipleIds((prev) =>
@@ -78,10 +88,10 @@ export const InterfaceCaptureScreen: React.FC = () => {
   };
 
   const handleSelectAllMultiple = () => {
-    if (selectedMultipleIds.length === AXON_INTERFACES.length) {
+    if (selectedMultipleIds.length === availableInterfaces.length) {
       setSelectedMultipleIds([]);
     } else {
-      setSelectedMultipleIds(AXON_INTERFACES.map((i) => i.id));
+      setSelectedMultipleIds(availableInterfaces.map((i) => i.id));
     }
   };
 
@@ -97,48 +107,68 @@ export const InterfaceCaptureScreen: React.FC = () => {
       if (captureScope === 'current') {
         // Target previous screen if came from another tool, or current screen
         const targetRoute = previousScreen && previousScreen !== 'tool_interface_capture' ? previousScreen : currentScreen;
-        const result = await captureLiveCurrentInterface(targetRoute, {
+        const results = await captureLiveInterfaceWithPanels(targetRoute, {
           fullHeight: isFull,
           format: imgFormat,
         });
 
-        const files: GeneratedResultFile[] = [
-          buildResultFileFromCapture(result, imgFormat === 'jpeg' ? 'jpg' : 'png'),
-        ];
+        const files: GeneratedResultFile[] = results.map((r) =>
+          buildResultFileFromCapture(r, imgFormat === 'jpeg' ? 'jpg' : 'png')
+        );
 
         if (exportFormat === 'pdf') {
-          const pdfDoc = await exportCapturesToPdf([result], getSafeInterfaceFileName(result.name, 'pdf'));
-          files.unshift(buildResultFileFromPdf(pdfDoc, result.name, result.category, result.route, 1));
+          const pdfDoc = await exportCapturesToPdf(results, getSafeInterfaceFileName(results[0].name, 'pdf'));
+          files.unshift(buildResultFileFromPdf(pdfDoc, results[0].name, results[0].category, results[0].route, results.length));
           triggerCaptureDownload(pdfDoc.dataUrl, pdfDoc.filename);
-          showToast('Exported PDF document');
+          showToast(`Exported ${results.length > 1 ? `${results.length}-page ` : ''}PDF document`);
+        } else if (exportFormat === 'long_image' && results.length > 1) {
+          const longImg = await stitchCanvasesVertically(results, { format: imgFormat });
+          files.unshift(buildResultFileFromStitched(longImg, `Combined Interfaces (${results.length})`, 'Combined Long Image'));
+          triggerCaptureDownload(longImg.dataUrl, longImg.filename);
+          showToast(`Stitched & exported ${results.length} captures as Long Image`);
+        } else {
+          showToast(
+            results.length > 1
+              ? `Captured "${results[0].name}" + ${results.length - 1} panels`
+              : `Captured "${results[0].name}" (${results[0].formattedSize})`
+          );
         }
 
-        setCapturedResults([result]);
+        setCapturedResults(results);
         setGeneratedFiles(files);
         setMultiReport(null);
-        showToast(`Captured "${result.name}" (${result.formattedSize})`);
         setTimeout(() => resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
       } else if (captureScope === 'specific') {
-        const result = await captureInterfaceById(selectedInterfaceId, {
+        const results = await captureInterfaceByIdWithPanels(selectedInterfaceId, {
           fullHeight: isFull,
           format: imgFormat,
         });
 
-        const files: GeneratedResultFile[] = [
-          buildResultFileFromCapture(result, imgFormat === 'jpeg' ? 'jpg' : 'png'),
-        ];
+        const files: GeneratedResultFile[] = results.map((r) =>
+          buildResultFileFromCapture(r, imgFormat === 'jpeg' ? 'jpg' : 'png')
+        );
 
         if (exportFormat === 'pdf') {
-          const pdfDoc = await exportCapturesToPdf([result], getSafeInterfaceFileName(result.name, 'pdf'));
-          files.unshift(buildResultFileFromPdf(pdfDoc, result.name, result.category, result.route, 1));
+          const pdfDoc = await exportCapturesToPdf(results, getSafeInterfaceFileName(results[0].name, 'pdf'));
+          files.unshift(buildResultFileFromPdf(pdfDoc, results[0].name, results[0].category, results[0].route, results.length));
           triggerCaptureDownload(pdfDoc.dataUrl, pdfDoc.filename);
-          showToast('Exported PDF document');
+          showToast(`Exported ${results.length > 1 ? `${results.length}-page ` : ''}PDF document`);
+        } else if (exportFormat === 'long_image' && results.length > 1) {
+          const longImg = await stitchCanvasesVertically(results, { format: imgFormat });
+          files.unshift(buildResultFileFromStitched(longImg, `Combined Interfaces (${results.length})`, 'Combined Long Image'));
+          triggerCaptureDownload(longImg.dataUrl, longImg.filename);
+          showToast(`Stitched & exported ${results.length} captures as Long Image`);
+        } else {
+          showToast(
+            results.length > 1
+              ? `Captured "${results[0].name}" + ${results.length - 1} panels`
+              : `Captured "${results[0].name}" (${results[0].formattedSize})`
+          );
         }
 
-        setCapturedResults([result]);
+        setCapturedResults(results);
         setGeneratedFiles(files);
         setMultiReport(null);
-        showToast(`Captured "${result.name}" (${result.formattedSize})`);
         setTimeout(() => resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
       } else if (captureScope === 'multiple') {
         if (selectedMultipleIds.length === 0) {
@@ -165,12 +195,14 @@ export const InterfaceCaptureScreen: React.FC = () => {
           });
 
           try {
-            const res = await captureInterfaceById(id, {
+            const itemResults = await captureInterfaceByIdWithPanels(id, {
               fullHeight: isFull,
               format: imgFormat,
             });
-            results.push(res);
-            files.push(buildResultFileFromCapture(res, imgFormat === 'jpeg' ? 'jpg' : 'png'));
+            results.push(...itemResults);
+            for (const r of itemResults) {
+              files.push(buildResultFileFromCapture(r, imgFormat === 'jpeg' ? 'jpg' : 'png'));
+            }
           } catch (err: any) {
             failures.push({ name, route: id, error: err?.message || 'Failed to capture' });
             files.push(buildFailureResultFile(name, id, err?.message || 'Failed to capture', meta?.category || 'Interface'));
@@ -318,7 +350,7 @@ export const InterfaceCaptureScreen: React.FC = () => {
     }
   };
 
-  const filteredInterfaces = AXON_INTERFACES.filter((i) => {
+  const filteredInterfaces = availableInterfaces.filter((i) => {
     const q = searchFilter.toLowerCase().trim();
     if (!q) return true;
     return (
@@ -397,7 +429,7 @@ export const InterfaceCaptureScreen: React.FC = () => {
                 onChange={(e) => setSelectedInterfaceId(e.target.value)}
                 className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-neutral-600"
               >
-                {AXON_INTERFACES.map((item) => (
+                {availableInterfaces.map((item) => (
                   <option key={item.id} value={item.id}>
                     [{item.category}] {item.name}
                   </option>
@@ -410,19 +442,19 @@ export const InterfaceCaptureScreen: React.FC = () => {
             <div className="mt-2 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-[11px] text-neutral-400">
-                  {selectedMultipleIds.length} of {AXON_INTERFACES.length} interfaces selected
+                  {selectedMultipleIds.length} of {availableInterfaces.length} interfaces selected
                 </span>
                 <button
                   type="button"
                   onClick={handleSelectAllMultiple}
                   className="text-[11px] text-sky-400 hover:text-sky-300 font-medium"
                 >
-                  {selectedMultipleIds.length === AXON_INTERFACES.length ? 'Deselect All' : 'Select All'}
+                  {selectedMultipleIds.length === availableInterfaces.length ? 'Deselect All' : 'Select All'}
                 </button>
               </div>
 
               <div className="max-h-44 overflow-y-auto space-y-1 p-1.5 rounded-xl bg-neutral-950 border border-neutral-800">
-                {AXON_INTERFACES.map((item) => {
+                {availableInterfaces.map((item) => {
                   const isChecked = selectedMultipleIds.includes(item.id);
                   return (
                     <div
@@ -451,7 +483,7 @@ export const InterfaceCaptureScreen: React.FC = () => {
           {captureScope === 'all' && (
             <div className="mt-2 p-2.5 rounded-xl bg-neutral-950/70 border border-neutral-800/80 text-xs text-neutral-300">
               <div className="flex items-center justify-between font-semibold text-white">
-                <span>Capture All {AXON_INTERFACES.length} Interfaces</span>
+                <span>Capture All {availableInterfaces.length} Interfaces</span>
                 <span className="text-[10px] font-mono text-neutral-400">Full System Pass</span>
               </div>
               <p className="text-[11px] text-neutral-400 mt-1 leading-relaxed">
@@ -491,7 +523,7 @@ export const InterfaceCaptureScreen: React.FC = () => {
               </button>
             </div>
             <p className="text-[10px] text-neutral-400 leading-tight">
-              {captureType === 'full' ? 'Captures entire scrollable height top-to-bottom' : 'Captures exact viewport dimensions'}
+              {captureType === 'full' ? 'Full interface + independent panel breakdown & full scroll' : 'Captures exact viewport dimensions'}
             </p>
           </div>
 
@@ -857,7 +889,7 @@ export const InterfaceCaptureScreen: React.FC = () => {
         <div className="space-y-2.5 pt-2">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-bold uppercase tracking-wider text-neutral-400">
-              Registered Interfaces ({AXON_INTERFACES.length})
+              Registered Interfaces ({availableInterfaces.length})
             </h3>
             <span className="text-[10px] text-neutral-500 font-mono">100% Real DOM</span>
           </div>
@@ -895,11 +927,15 @@ export const InterfaceCaptureScreen: React.FC = () => {
                   onClick={async () => {
                     try {
                       setIsCapturing(true);
-                      const res = await captureInterfaceById(item.id, { fullHeight: captureType === 'full' });
-                      setCapturedResults((prev) => [res, ...prev]);
-                      const newFile = buildResultFileFromCapture(res);
-                      setGeneratedFiles((prev) => [newFile, ...prev]);
-                      showToast(`Captured "${item.name}"`);
+                      const itemResults = await captureInterfaceByIdWithPanels(item.id, { fullHeight: captureType === 'full' });
+                      setCapturedResults((prev) => [...itemResults, ...prev]);
+                      const newFiles = itemResults.map((r) => buildResultFileFromCapture(r));
+                      setGeneratedFiles((prev) => [...newFiles, ...prev]);
+                      showToast(
+                        itemResults.length > 1
+                          ? `Captured "${item.name}" + ${itemResults.length - 1} panels`
+                          : `Captured "${item.name}"`
+                      );
                       setTimeout(() => resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
                     } catch (err: any) {
                       const failFile = buildFailureResultFile(item.name, item.id, err?.message || 'Capture failed', item.category);

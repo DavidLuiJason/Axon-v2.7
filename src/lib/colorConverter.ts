@@ -360,37 +360,62 @@ export function wrapWindowGetComputedStyle(win: Window): () => void {
 
   const sanitizeValue = (val: any): any => {
     if (typeof val === 'string' && containsModernColorFunction(val)) {
-      return replaceModernColorsInCss(val);
+      try {
+        return replaceModernColorsInCss(val);
+      } catch {
+        return val;
+      }
     }
     return val;
   };
 
   const createProxy = (decl: CSSStyleDeclaration): CSSStyleDeclaration => {
     return new Proxy(decl, {
-      get(target, prop, receiver) {
+      get(target, prop) {
         if (prop === 'getPropertyValue') {
-          return (propertyName: string) => {
-            const v = target.getPropertyValue(propertyName);
-            return sanitizeValue(v);
+          return function (propertyName: string) {
+            try {
+              const v = target.getPropertyValue(propertyName);
+              return sanitizeValue(v);
+            } catch {
+              return '';
+            }
           };
         }
-        const val = Reflect.get(target, prop, receiver);
-        if (typeof val === 'function') {
-          return val.bind(target);
+        try {
+          // Direct property lookup on target ensures the native CSSStyleDeclaration is 'this'
+          const val = (target as any)[prop];
+          if (typeof val === 'function') {
+            return val.bind(target);
+          }
+          return sanitizeValue(val);
+        } catch {
+          return undefined;
         }
-        return sanitizeValue(val);
       },
     });
   };
 
-  win.getComputedStyle = function (elt: Element, pseudoElt?: string | null) {
-    const decl = orig.call(win, elt, pseudoElt);
-    if (!decl) return decl;
-    return createProxy(decl);
-  } as typeof win.getComputedStyle;
+  try {
+    win.getComputedStyle = function (elt: Element, pseudoElt?: string | null) {
+      try {
+        const decl = orig.call(win, elt, pseudoElt);
+        if (!decl) return decl;
+        return createProxy(decl);
+      } catch {
+        return orig.call(win, elt, pseudoElt);
+      }
+    } as typeof win.getComputedStyle;
+  } catch {
+    // Non-fatal if setting fails
+  }
 
   return () => {
-    win.getComputedStyle = orig;
+    try {
+      win.getComputedStyle = orig;
+    } catch {
+      // Ignore restore errors
+    }
   };
 }
 

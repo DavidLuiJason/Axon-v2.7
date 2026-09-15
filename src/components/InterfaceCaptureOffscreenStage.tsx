@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { ScreenId } from '../types';
 import { useApp } from '../context/AppContext';
-import { registerOffscreenStageRequester } from '../lib/interfaceCaptureEngine';
+import { registerOffscreenStageRequester, StageHandle } from '../lib/interfaceCaptureEngine';
 
 import { DualPaneContainer } from './DualPaneContainer';
 import { ToolsMenuScreen } from '../screens/ToolsMenuScreen';
@@ -22,70 +22,157 @@ import { SpeechRateAnalysisScreen } from '../screens/tools/SpeechRateAnalysisScr
 import { OfflineBibleScreen } from '../screens/tools/OfflineBibleScreen';
 import { InterfaceCaptureScreen } from '../screens/tools/InterfaceCaptureScreen';
 
-interface PendingStageRequest {
+// Registry of built-in screens
+const STAGE_BUILTIN_COMPONENTS: Record<string, React.ComponentType<any>> = {
+  axon: DualPaneContainer,
+  tools: ToolsMenuScreen,
+  code: AxonCodeScreen,
+  automation: AutomationScreen,
+  video_editor: VideoEditorScreen,
+  notes: NotesScreen,
+  settings: SettingsScreen,
+  account: AccountScreen,
+  notifications: NotificationsScreen,
+  tool_text: TextToolsScreen,
+  tool_calc: CalculationToolsScreen,
+  tool_units: CalculationToolsScreen,
+  tool_colors: ColorToolsScreen,
+  tool_images: ImageToolsScreen,
+  tool_files: FileConversionToolsScreen,
+  tool_speech_rate: SpeechRateAnalysisScreen,
+  tool_bible: OfflineBibleScreen,
+  storage: StorageDiagnosticsScreen,
+  tool_interface_capture: InterfaceCaptureScreen,
+};
+
+// Dynamic component registry for future-proof runtime interface additions
+const dynamicStageComponents = new Map<string, React.ComponentType<any>>();
+
+export function registerDynamicStageComponent(
+  route: string,
+  component: React.ComponentType<any>
+): void {
+  dynamicStageComponents.set(route, component);
+}
+
+export function unregisterDynamicStageComponent(route: string): void {
+  dynamicStageComponents.delete(route);
+}
+
+interface QueuedStageRequest {
+  id: number;
   route: ScreenId;
   isFull: boolean;
-  resolve: (element: HTMLElement | null) => void;
+  resolve: (handle: StageHandle | null) => void;
   reject: (err: any) => void;
 }
 
+let requestIdCounter = 0;
+
 export const InterfaceCaptureOffscreenStage: React.FC = () => {
   const { theme } = useApp();
-  const [activeRequest, setActiveRequest] = useState<PendingStageRequest | null>(null);
+  const [activeRequest, setActiveRequest] = useState<QueuedStageRequest | null>(null);
+  const queueRef = useRef<QueuedStageRequest[]>([]);
+  const isBusyRef = useRef<boolean>(false);
   const stageRef = useRef<HTMLDivElement>(null);
 
+  const processQueue = useCallback(() => {
+    if (isBusyRef.current) return;
+    if (queueRef.current.length === 0) {
+      setActiveRequest(null);
+      return;
+    }
+
+    const next = queueRef.current.shift()!;
+    isBusyRef.current = true;
+    setActiveRequest(next);
+  }, []);
+
+  const releaseCurrentRequest = useCallback(() => {
+    isBusyRef.current = false;
+    processQueue();
+  }, [processQueue]);
+
   useEffect(() => {
-    // Register this component as the offscreen stage provider
+    // Register the FIFO queue-backed offscreen stage requester
     registerOffscreenStageRequester((route: ScreenId, isFull: boolean) => {
-      return new Promise<HTMLElement | null>((resolve, reject) => {
-        setActiveRequest({
+      return new Promise<StageHandle | null>((resolve, reject) => {
+        const item: QueuedStageRequest = {
+          id: ++requestIdCounter,
           route,
           isFull,
           resolve,
           reject,
-        });
+        };
+        queueRef.current.push(item);
+        processQueue();
       });
     });
 
     return () => {
       registerOffscreenStageRequester(null);
+      queueRef.current = [];
+      isBusyRef.current = false;
     };
-  }, []);
+  }, [processQueue]);
 
-  // When activeRequest changes, notify once rendered
+  // When activeRequest changes, wait for DOM layout and resolve with release handle
   useEffect(() => {
     if (!activeRequest) return;
 
     let isMounted = true;
-    // Wait two animation frames for component tree to mount and compute layout styles
-    const timeoutId = setTimeout(() => {
+    let hasReleased = false;
+
+    const safeRelease = () => {
+      if (hasReleased) return;
+      hasReleased = true;
+      releaseCurrentRequest();
+    };
+
+    // Watchdog timer: If caller fails to release within 12s, release automatically to prevent stalled queue
+    const watchdogTimer = setTimeout(() => {
+      if (!hasReleased && isMounted) {
+        console.warn(`Stage watchdog auto-released request for "${activeRequest.route}"`);
+        safeRelease();
+      }
+    }, 12000);
+
+    // Wait 80ms + 2 animation frames for children to mount and compute styles
+    const renderTimer = setTimeout(() => {
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          if (isMounted && activeRequest) {
-            const el = stageRef.current;
-            activeRequest.resolve(el);
-            // Delay clearing so html2canvas has ample time to read canvas
-            setTimeout(() => {
-              if (isMounted) {
-                setActiveRequest(null);
-              }
-            }, 4000);
+          if (!isMounted || hasReleased) return;
+
+          const el = stageRef.current;
+          if (el) {
+            activeRequest.resolve({
+              element: el,
+              release: safeRelease,
+            });
+          } else {
+            activeRequest.reject(
+              new Error(`Stage element unavailable for route "${activeRequest.route}"`)
+            );
+            safeRelease();
           }
         });
       });
-    }, 120);
+    }, 80);
 
     return () => {
       isMounted = false;
-      clearTimeout(timeoutId);
+      clearTimeout(renderTimer);
+      clearTimeout(watchdogTimer);
     };
-  }, [activeRequest?.route, activeRequest?.isFull]);
+  }, [activeRequest, releaseCurrentRequest]);
 
   if (!activeRequest) {
     return null;
   }
 
   const { route, isFull } = activeRequest;
+  const Component = STAGE_BUILTIN_COMPONENTS[route] || dynamicStageComponents.get(route);
+  const formattedTitle = route.replace(/_/g, ' ').toUpperCase();
 
   return (
     <div
@@ -108,35 +195,27 @@ export const InterfaceCaptureOffscreenStage: React.FC = () => {
       }`}
       aria-hidden="true"
     >
-      {/* Offscreen Simulated Top Header Bar */}
+      {/* Offscreen Top Header Bar */}
       <div className="h-12 w-full bg-black border-b border-neutral-800 px-3 flex items-center justify-between shrink-0">
-        <span className="text-xs font-bold tracking-tight text-white uppercase">
-          AXON • {route.replace(/_/g, ' ')}
+        <span className="text-xs font-bold tracking-tight text-white">
+          AXON • {formattedTitle}
         </span>
         <span className="text-[10px] font-mono text-neutral-400">OFFLINE UI</span>
       </div>
 
       {/* Screen Component */}
-      <div className={`flex-1 min-h-0 flex flex-col ${isFull ? 'h-auto overflow-visible' : 'overflow-hidden'}`}>
-        {route === 'axon' && <DualPaneContainer />}
-        {route === 'tools' && <ToolsMenuScreen />}
-        {route === 'code' && <AxonCodeScreen />}
-        {route === 'automation' && <AutomationScreen />}
-        {route === 'video_editor' && <VideoEditorScreen />}
-        {route === 'notes' && <NotesScreen />}
-        {route === 'settings' && <SettingsScreen />}
-        {route === 'account' && <AccountScreen />}
-        {route === 'notifications' && <NotificationsScreen />}
-        {route === 'tool_text' && <TextToolsScreen />}
-        {route === 'tool_calc' && <CalculationToolsScreen />}
-        {route === 'tool_units' && <CalculationToolsScreen />}
-        {route === 'tool_colors' && <ColorToolsScreen />}
-        {route === 'tool_images' && <ImageToolsScreen />}
-        {route === 'tool_files' && <FileConversionToolsScreen />}
-        {route === 'tool_speech_rate' && <SpeechRateAnalysisScreen />}
-        {route === 'tool_bible' && <OfflineBibleScreen />}
-        {route === 'storage' && <StorageDiagnosticsScreen />}
-        {route === 'tool_interface_capture' && <InterfaceCaptureScreen />}
+      <div
+        className={`flex-1 min-h-0 flex flex-col ${
+          isFull ? 'h-auto overflow-visible' : 'overflow-hidden'
+        }`}
+      >
+        {Component ? (
+          <Component />
+        ) : (
+          <div className="flex-1 flex items-center justify-center p-8 text-neutral-500 text-xs font-mono">
+            Interface component for &quot;{route}&quot; not registered
+          </div>
+        )}
       </div>
     </div>
   );

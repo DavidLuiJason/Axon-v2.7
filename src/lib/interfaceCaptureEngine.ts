@@ -6,6 +6,7 @@ import {
   InterfaceMetadata,
   getInterfaceById,
   getSafeInterfaceFileName,
+  discoverAvailableInterfaces,
 } from './interfaceRegistry';
 import { sanitizeClonedTreeForCapture, wrapWindowGetComputedStyle } from './colorConverter';
 
@@ -40,6 +41,7 @@ export interface CapturedInterfaceResult {
   format: 'png' | 'jpeg';
   isSuccess: boolean;
   error?: string;
+  panelResults?: CapturedInterfaceResult[];
 }
 
 export interface CaptureEngineOptions {
@@ -47,6 +49,7 @@ export interface CaptureEngineOptions {
   fullHeight?: boolean;
   format?: 'png' | 'jpeg';
   quality?: number;
+  includePanels?: boolean;
   onProgress?: (progress: { current: number; total: number; interfaceName: string; percent: number }) => void;
 }
 
@@ -71,7 +74,16 @@ export interface MultiCaptureReport {
 }
 
 // Stage controller types for offscreen rendering
-type StageRenderRequester = (route: ScreenId, isFull: boolean) => Promise<HTMLElement | null>;
+export interface StageHandle {
+  element: HTMLElement;
+  release: () => void;
+}
+
+export type StageRenderRequester = (
+  route: ScreenId,
+  isFull: boolean
+) => Promise<HTMLElement | StageHandle | null>;
+
 let globalStageRequester: StageRenderRequester | null = null;
 
 export function registerOffscreenStageRequester(requester: StageRenderRequester | null): void {
@@ -92,7 +104,13 @@ function formatByteSize(bytes: number): string {
  */
 export async function captureDomElement(
   element: HTMLElement,
-  options: { scale?: number; fullHeight?: boolean; format?: 'png' | 'jpeg'; quality?: number } = {}
+  options: {
+    scale?: number;
+    fullHeight?: boolean;
+    format?: 'png' | 'jpeg';
+    quality?: number;
+    windowWidth?: number;
+  } = {}
 ): Promise<HTMLCanvasElement> {
   const scale = options.scale ?? 2;
   const isFull = options.fullHeight ?? false;
@@ -140,7 +158,7 @@ export async function captureDomElement(
         logging: false,
         scrollX: 0,
         scrollY: 0,
-        windowWidth: element.scrollWidth || 430,
+        windowWidth: options.windowWidth || element.scrollWidth || 430,
         windowHeight: isFull ? Math.max(element.scrollHeight, 800) : element.clientHeight || 932,
         onclone: (clonedDoc, clonedElement) => {
           if (clonedDoc.defaultView && clonedDoc.defaultView !== window) {
@@ -166,13 +184,602 @@ export async function captureDomElement(
   }
 }
 
+export interface DetectedPanel {
+  element: HTMLElement;
+  id: string;
+  name: string;
+  index: number;
+  isScrollable: boolean;
+  scrollElement: HTMLElement | null;
+}
+
+export interface MultiPanelDetection {
+  hasMultiplePanels: boolean;
+  trackElement: HTMLElement | null;
+  containerElement: HTMLElement | null;
+  panels: DetectedPanel[];
+}
+
 /**
- * Captures the currently active live interface visible on the screen.
+ * Checks if an element is an independently scrollable container using DOM inspection.
  */
-export async function captureLiveCurrentInterface(
+export function isScrollableElement(el: HTMLElement): boolean {
+  if (el.scrollHeight <= el.clientHeight && el.scrollWidth <= el.clientWidth) {
+    return false;
+  }
+  if (el.clientHeight < 60 || el.clientWidth < 60) {
+    return false;
+  }
+  const style = window.getComputedStyle(el);
+  return (
+    style.overflowY === 'auto' ||
+    style.overflowY === 'scroll' ||
+    style.overflowX === 'auto' ||
+    style.overflowX === 'scroll' ||
+    style.overflow === 'auto' ||
+    style.overflow === 'scroll'
+  );
+}
+
+/**
+ * Finds the primary scrollable container within a given panel element.
+ */
+export function findScrollContainer(element: HTMLElement): HTMLElement | null {
+  if (isScrollableElement(element)) {
+    return element;
+  }
+  const scrollables = Array.from(element.querySelectorAll<HTMLElement>('*')).filter(isScrollableElement);
+  if (scrollables.length === 0) {
+    const byClass = element.querySelector<HTMLElement>('.overflow-y-auto, .overflow-auto');
+    if (byClass && byClass.scrollHeight > byClass.clientHeight) return byClass;
+    return null;
+  }
+  scrollables.sort((a, b) => b.scrollHeight * b.clientWidth - a.scrollHeight * a.clientWidth);
+  return scrollables[0];
+}
+
+/**
+ * Inspects the actual DOM to detect side-by-side panels, dual-pane layouts,
+ * split views, or independently scrollable panels.
+ */
+export function detectInterfacePanels(rootElement: HTMLElement, baseName: string): MultiPanelDetection {
+  // 1. Direct check: AXON DualPaneContainer or explicit dual-pane structures
+  const track = (rootElement.id === 'dual-pane-track'
+    ? rootElement
+    : rootElement.querySelector('#dual-pane-track')) as HTMLElement | null;
+
+  if (track) {
+    const container =
+      (rootElement.id === 'dual-pane-container'
+        ? rootElement
+        : rootElement.querySelector('#dual-pane-container') || track.parentElement) as HTMLElement | null;
+
+    const left = (track.querySelector('#dual-pane-left') || track.children[0]) as HTMLElement | null;
+    const right = (track.querySelector('#dual-pane-right') || track.children[1]) as HTMLElement | null;
+
+    if (left && right) {
+      const panels: DetectedPanel[] = [
+        {
+          element: left,
+          id: 'dual-pane-left',
+          name: `${baseName} — Left Panel`,
+          index: 0,
+          isScrollable: true,
+          scrollElement: findScrollContainer(left),
+        },
+        {
+          element: right,
+          id: 'dual-pane-right',
+          name: `${baseName} — Right Panel`,
+          index: 1,
+          isScrollable: true,
+          scrollElement: findScrollContainer(right),
+        },
+      ];
+
+      return {
+        hasMultiplePanels: true,
+        trackElement: track,
+        containerElement: container,
+        panels,
+      };
+    }
+  }
+
+  // 2. Check for flex-row or grid containers with side-by-side children
+  const potentialTracks = Array.from(
+    rootElement.querySelectorAll<HTMLElement>('*')
+  ).filter((el) => {
+    if (el.clientWidth < 160 || el.clientHeight < 100) return false;
+    const style = window.getComputedStyle(el);
+    const isRow =
+      (style.display.includes('flex') && style.flexDirection === 'row') ||
+      style.display.includes('grid');
+    return isRow && el.children.length >= 2;
+  });
+
+  for (const pTrack of potentialTracks) {
+    const substantiveChildren = Array.from(pTrack.children).filter(
+      (c): c is HTMLElement =>
+        c instanceof HTMLElement && c.offsetWidth >= 80 && c.offsetHeight >= 80
+    );
+
+    if (substantiveChildren.length >= 2) {
+      const rect0 = substantiveChildren[0].getBoundingClientRect();
+      const rect1 = substantiveChildren[1].getBoundingClientRect();
+      const isSideBySide =
+        rect0.left < rect1.left || substantiveChildren[0].offsetLeft < substantiveChildren[1].offsetLeft;
+
+      if (isSideBySide) {
+        const panels: DetectedPanel[] = substantiveChildren.map((child, idx) => {
+          const headerText = child
+            .querySelector('h1, h2, h3, h4, header, [role="heading"]')
+            ?.textContent?.trim()
+            ?.slice(0, 24);
+
+          let panelLabel = `${baseName} — Panel ${idx + 1}`;
+          if (substantiveChildren.length === 2) {
+            panelLabel = idx === 0 ? `${baseName} — Left Panel` : `${baseName} — Right Panel`;
+          }
+          if (headerText) {
+            panelLabel += ` (${headerText})`;
+          }
+
+          const scrollEl = findScrollContainer(child);
+          return {
+            element: child,
+            id: child.id || `panel-${idx}`,
+            name: panelLabel,
+            index: idx,
+            isScrollable: !!scrollEl,
+            scrollElement: scrollEl,
+          };
+        });
+
+        return {
+          hasMultiplePanels: true,
+          trackElement: pTrack,
+          containerElement: pTrack.parentElement,
+          panels,
+        };
+      }
+    }
+  }
+
+  // 3. Check for multiple top-level independently scrollable containers
+  const allScrollables = Array.from(
+    rootElement.querySelectorAll<HTMLElement>('*')
+  ).filter((el) => isScrollableElement(el) && el.offsetWidth >= 100 && el.offsetHeight >= 100);
+
+  const topScrollables = allScrollables.filter(
+    (el) => !allScrollables.some((other) => other !== el && other.contains(el))
+  );
+
+  if (topScrollables.length >= 2) {
+    topScrollables.sort(
+      (a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left
+    );
+
+    const panels: DetectedPanel[] = topScrollables.map((el, idx) => {
+      let panelLabel = `${baseName} — Panel ${idx + 1}`;
+      if (topScrollables.length === 2) {
+        panelLabel = idx === 0 ? `${baseName} — Left Panel` : `${baseName} — Right Panel`;
+      }
+      return {
+        element: el,
+        id: el.id || `scroll-panel-${idx}`,
+        name: panelLabel,
+        index: idx,
+        isScrollable: true,
+        scrollElement: el,
+      };
+    });
+
+    return {
+      hasMultiplePanels: true,
+      trackElement: null,
+      containerElement: null,
+      panels,
+    };
+  }
+
+  return {
+    hasMultiplePanels: false,
+    trackElement: null,
+    containerElement: null,
+    panels: [],
+  };
+}
+
+/**
+ * Stitches captured scroll slices of an individual panel together into a seamless composite.
+ */
+function stitchPanelSlices(
+  slices: HTMLCanvasElement[],
+  scrollEl: HTMLElement,
+  panelEl: HTMLElement,
+  positions: number[],
+  scale: number
+): HTMLCanvasElement {
+  if (slices.length === 0) {
+    return document.createElement('canvas');
+  }
+  if (slices.length === 1) {
+    return slices[0];
+  }
+
+  const panelRect = panelEl.getBoundingClientRect();
+  const scrollRect = scrollEl.getBoundingClientRect();
+
+  const topOffsetPx = Math.max(0, Math.round((scrollRect.top - panelRect.top) * scale));
+  const bottomOffsetPx = Math.max(0, Math.round((panelRect.bottom - scrollRect.bottom) * scale));
+  const totalScrollPx = Math.round(scrollEl.scrollHeight * scale);
+
+  const canvasWidth = slices[0].width;
+  const totalCanvasHeight = Math.max(
+    topOffsetPx + totalScrollPx + bottomOffsetPx,
+    slices[0].height
+  );
+
+  const master = document.createElement('canvas');
+  master.width = canvasWidth;
+  master.height = totalCanvasHeight;
+  const ctx = master.getContext('2d');
+  if (!ctx) return slices[0];
+
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, master.width, master.height);
+
+  // 1. Draw top fixed header from slice 0
+  if (topOffsetPx > 0) {
+    ctx.drawImage(
+      slices[0],
+      0, 0, canvasWidth, topOffsetPx,
+      0, 0, canvasWidth, topOffsetPx
+    );
+  }
+
+  // 2. Draw scroll body slices
+  for (let k = 0; k < positions.length; k++) {
+    const currentScroll = positions[k];
+    const nextScroll = k + 1 < positions.length ? positions[k + 1] : scrollEl.scrollHeight - scrollEl.clientHeight;
+    const sliceCanvas = slices[k];
+
+    const destY = topOffsetPx + Math.round(currentScroll * scale);
+    const sliceHeight = k + 1 < positions.length
+      ? Math.round((nextScroll - currentScroll) * scale)
+      : Math.round((scrollEl.scrollHeight - currentScroll) * scale);
+
+    const srcY = topOffsetPx;
+    ctx.drawImage(
+      sliceCanvas,
+      0, srcY, canvasWidth, sliceHeight,
+      0, destY, canvasWidth, sliceHeight
+    );
+  }
+
+  // 3. Draw bottom fixed footer from last slice
+  if (bottomOffsetPx > 0) {
+    const lastSlice = slices[slices.length - 1];
+    const srcFooterY = lastSlice.height - bottomOffsetPx;
+    const destFooterY = master.height - bottomOffsetPx;
+    ctx.drawImage(
+      lastSlice,
+      0, srcFooterY, canvasWidth, bottomOffsetPx,
+      0, destFooterY, canvasWidth, bottomOffsetPx
+    );
+  }
+
+  return master;
+}
+
+/**
+ * Captures an individual panel across its different scroll positions independently.
+ * Scrolls ONLY this panel while preserving all other panels stationary.
+ * Restores the panel to its original scroll position after capture.
+ */
+async function capturePanelWithIndependentScrolling(
+  panel: DetectedPanel,
+  allPanels: DetectedPanel[],
+  options: {
+    scale?: number;
+    format?: 'png' | 'jpeg';
+    quality?: number;
+    fullHeight?: boolean;
+  }
+): Promise<HTMLCanvasElement> {
+  const scale = options.scale ?? 2;
+  const scrollEl = panel.scrollElement;
+
+  // Snapshot initial scroll state for ALL panels to ensure total isolation
+  const initialScrolls = new Map<HTMLElement, { top: number; left: number }>();
+  for (const p of allPanels) {
+    if (p.scrollElement) {
+      initialScrolls.set(p.scrollElement, {
+        top: p.scrollElement.scrollTop,
+        left: p.scrollElement.scrollLeft,
+      });
+    }
+  }
+
+  try {
+    // If no scroll container or not enough scrollable content, capture single state
+    if (!scrollEl || scrollEl.scrollHeight <= scrollEl.clientHeight + 15) {
+      return await captureDomElement(panel.element, {
+        scale,
+        fullHeight: options.fullHeight ?? false,
+        format: options.format,
+        quality: options.quality,
+      });
+    }
+
+    // Multiple scroll positions exist: calculate scroll positions
+    const clientH = scrollEl.clientHeight;
+    const scrollH = scrollEl.scrollHeight;
+    const maxScroll = scrollH - clientH;
+    const step = Math.max(120, clientH - 40);
+
+    const positions: number[] = [];
+    for (let y = 0; y < maxScroll; y += step) {
+      positions.push(y);
+    }
+    if (positions[positions.length - 1] !== maxScroll) {
+      positions.push(maxScroll);
+    }
+
+    if (positions.length <= 1) {
+      return await captureDomElement(panel.element, {
+        scale,
+        fullHeight: options.fullHeight ?? false,
+        format: options.format,
+        quality: options.quality,
+      });
+    }
+
+    // Iterate through positions, scrolling ONLY this panel
+    const positionCanvases: HTMLCanvasElement[] = [];
+
+    for (let i = 0; i < positions.length; i++) {
+      const targetY = positions[i];
+
+      // Scroll ONLY this panel's scroll element
+      scrollEl.scrollTop = targetY;
+
+      // Lock and verify other panels remain stationary at their initial positions
+      for (const other of allPanels) {
+        if (other !== panel && other.scrollElement) {
+          const init = initialScrolls.get(other.scrollElement);
+          if (init && other.scrollElement.scrollTop !== init.top) {
+            other.scrollElement.scrollTop = init.top;
+          }
+        }
+      }
+
+      // Allow 1 frame for browser repaint of scrolled content
+      await new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 35)));
+
+      // Capture panel at this scroll position
+      const sliceCanvas = await captureDomElement(panel.element, {
+        scale,
+        fullHeight: false,
+        format: options.format,
+        quality: options.quality,
+      });
+      positionCanvases.push(sliceCanvas);
+    }
+
+    // Stitch the position canvases together
+    return stitchPanelSlices(positionCanvases, scrollEl, panel.element, positions, scale);
+  } finally {
+    // ALWAYS restore all panels to their exact original scroll positions
+    for (const [el, pos] of initialScrolls.entries()) {
+      el.scrollTop = pos.top;
+      el.scrollLeft = pos.left;
+    }
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  }
+}
+
+/**
+ * Captures the complete side-by-side interface with both panels visible together.
+ * Preserves the panels side-by-side without vertical stacking or UI modification.
+ * Fully restores all styles after capture.
+ */
+async function captureCompleteSideBySideInterface(
+  targetElement: HTMLElement,
+  detection: MultiPanelDetection,
+  options: {
+    scale?: number;
+    format?: 'png' | 'jpeg';
+    quality?: number;
+    fullHeight?: boolean;
+  }
+): Promise<HTMLCanvasElement> {
+  const scale = options.scale ?? 2;
+  const track = detection.trackElement;
+  const container = detection.containerElement || track?.parentElement;
+  const stage = document.getElementById('axon-offscreen-capture-stage');
+
+  let restoreSideBySide: (() => void) | null = null;
+
+  if (track && detection.panels.length >= 2) {
+    const leftWidth = detection.panels[0].element.offsetWidth || 430;
+    const rightWidth = detection.panels[1].element.offsetWidth || 430;
+    const totalSideBySideWidth = leftWidth + rightWidth;
+
+    const prevTrackTransform = track.style.transform;
+    const prevTrackTransition = track.style.transition;
+    const prevTrackWidth = track.style.width;
+    const prevContainerWidth = container ? container.style.width : '';
+    const prevContainerOverflow = container ? container.style.overflow : '';
+    const prevStageWidth = stage ? stage.style.width : '';
+
+    track.style.transition = 'none';
+    track.style.transform = 'translate3d(0, 0, 0)';
+
+    if (container) {
+      container.style.overflow = 'visible';
+      container.style.width = `${totalSideBySideWidth}px`;
+    }
+    if (stage) {
+      stage.style.width = `${totalSideBySideWidth}px`;
+    }
+
+    restoreSideBySide = () => {
+      track.style.transform = prevTrackTransform;
+      track.style.transition = prevTrackTransition;
+      track.style.width = prevTrackWidth;
+      if (container) {
+        container.style.width = prevContainerWidth;
+        container.style.overflow = prevContainerOverflow;
+      }
+      if (stage) {
+        stage.style.width = prevStageWidth;
+      }
+    };
+  }
+
+  try {
+    await new Promise((r) => requestAnimationFrame(r));
+    return await captureDomElement(targetElement, {
+      scale,
+      fullHeight: false, // Preserves side-by-side layout intact
+      format: options.format,
+      quality: options.quality,
+      windowWidth: track && detection.panels.length >= 2
+        ? (detection.panels[0].element.offsetWidth || 430) + (detection.panels[1].element.offsetWidth || 430)
+        : undefined,
+    });
+  } finally {
+    if (restoreSideBySide) {
+      restoreSideBySide();
+      await new Promise((r) => requestAnimationFrame(r));
+    }
+  }
+}
+
+/**
+ * Core element capture pipeline that produces both the complete interface and
+ * individual panel captures with independent scrolling when multi-panel is detected.
+ */
+async function executeElementCaptureWithPanels(
+  targetElement: HTMLElement,
+  meta: InterfaceMetadata,
+  options: CaptureEngineOptions,
+  format: 'png' | 'jpeg',
+  quality: number
+): Promise<CapturedInterfaceResult[]> {
+  const detection = detectInterfacePanels(targetElement, meta.name);
+  const mime = format === 'jpeg' ? 'image/jpeg' : 'image/png';
+  const results: CapturedInterfaceResult[] = [];
+
+  if (!detection.hasMultiplePanels || options.includePanels === false) {
+    const canvas = await captureDomElement(targetElement, {
+      scale: options.scale ?? 2,
+      fullHeight: options.fullHeight ?? false,
+      format,
+      quality,
+    });
+
+    const dataUrl = canvas.toDataURL(mime, quality);
+    const approxBytes = Math.round((dataUrl.length * 3) / 4);
+
+    const singleResult: CapturedInterfaceResult = {
+      id: meta.id,
+      name: meta.name,
+      category: meta.category,
+      route: meta.route,
+      canvas,
+      dataUrl,
+      width: canvas.width,
+      height: canvas.height,
+      sizeBytes: approxBytes,
+      formattedSize: formatByteSize(approxBytes),
+      capturedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      format,
+      isSuccess: true,
+      panelResults: [],
+    };
+
+    return [singleResult];
+  }
+
+  // 1. Capture the COMPLETE SIDE-BY-SIDE INTERFACE
+  const fullCanvas = await captureCompleteSideBySideInterface(targetElement, detection, {
+    scale: options.scale ?? 2,
+    fullHeight: false,
+    format,
+    quality,
+  });
+
+  const fullDataUrl = fullCanvas.toDataURL(mime, quality);
+  const fullBytes = Math.round((fullDataUrl.length * 3) / 4);
+
+  const fullResult: CapturedInterfaceResult = {
+    id: `${meta.id}-full`,
+    name: `${meta.name} — Full Interface`,
+    category: meta.category,
+    route: meta.route,
+    canvas: fullCanvas,
+    dataUrl: fullDataUrl,
+    width: fullCanvas.width,
+    height: fullCanvas.height,
+    sizeBytes: fullBytes,
+    formattedSize: formatByteSize(fullBytes),
+    capturedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    format,
+    isSuccess: true,
+    panelResults: [],
+  };
+
+  results.push(fullResult);
+
+  // 2. Capture EACH PANEL INDIVIDUALLY with INDEPENDENT SCROLLING
+  const panelResults: CapturedInterfaceResult[] = [];
+
+  for (const panel of detection.panels) {
+    const panelCanvas = await capturePanelWithIndependentScrolling(panel, detection.panels, {
+      scale: options.scale ?? 2,
+      format,
+      quality,
+      fullHeight: options.fullHeight ?? true,
+    });
+
+    const panelDataUrl = panelCanvas.toDataURL(mime, quality);
+    const panelBytes = Math.round((panelDataUrl.length * 3) / 4);
+
+    const pResult: CapturedInterfaceResult = {
+      id: `${meta.id}-panel-${panel.index}`,
+      name: panel.name,
+      category: meta.category,
+      route: meta.route,
+      canvas: panelCanvas,
+      dataUrl: panelDataUrl,
+      width: panelCanvas.width,
+      height: panelCanvas.height,
+      sizeBytes: panelBytes,
+      formattedSize: formatByteSize(panelBytes),
+      capturedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      format,
+      isSuccess: true,
+    };
+
+    panelResults.push(pResult);
+    results.push(pResult);
+  }
+
+  fullResult.panelResults = panelResults;
+  return results;
+}
+
+/**
+ * Captures the currently active live interface visible on the screen, including
+ * both the full side-by-side view and individual panels if multi-panel layout is detected.
+ */
+export async function captureLiveInterfaceWithPanels(
   currentScreen: ScreenId,
   options: CaptureEngineOptions = {}
-): Promise<CapturedInterfaceResult> {
+): Promise<CapturedInterfaceResult[]> {
   const format = options.format || 'png';
   const quality = options.quality ?? 0.92;
   const meta = getInterfaceById(currentScreen) || {
@@ -187,7 +794,6 @@ export async function captureLiveCurrentInterface(
     keywords: [],
   };
 
-  // Find the live container in DOM
   const targetElement =
     (document.getElementById(`screen-container-${currentScreen}`) as HTMLElement) ||
     (document.getElementById('app-main-viewport') as HTMLElement) ||
@@ -195,32 +801,7 @@ export async function captureLiveCurrentInterface(
     document.body;
 
   try {
-    const canvas = await captureDomElement(targetElement, {
-      scale: options.scale ?? 2,
-      fullHeight: options.fullHeight ?? false,
-      format,
-      quality,
-    });
-
-    const mime = format === 'jpeg' ? 'image/jpeg' : 'image/png';
-    const dataUrl = canvas.toDataURL(mime, quality);
-    const approxBytes = Math.round((dataUrl.length * 3) / 4);
-
-    return {
-      id: meta.id,
-      name: meta.name,
-      category: meta.category,
-      route: meta.route,
-      canvas,
-      dataUrl,
-      width: canvas.width,
-      height: canvas.height,
-      sizeBytes: approxBytes,
-      formattedSize: formatByteSize(approxBytes),
-      capturedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-      format,
-      isSuccess: true,
-    };
+    return await executeElementCaptureWithPanels(targetElement, meta, options, format, quality);
   } catch (err: any) {
     console.error(`Failed to capture current interface (${currentScreen}):`, err);
     throw new Error(`Unable to capture current interface: ${err?.message || 'Rendering error'}`);
@@ -228,12 +809,13 @@ export async function captureLiveCurrentInterface(
 }
 
 /**
- * Captures a specific interface in the background without navigating the user's active screen.
+ * Captures a specific interface in the background without navigating the active screen,
+ * including both the full side-by-side view and individual panels if multi-panel layout is detected.
  */
-export async function captureInterfaceById(
+export async function captureInterfaceByIdWithPanels(
   interfaceIdOrRoute: string,
   options: CaptureEngineOptions = {}
-): Promise<CapturedInterfaceResult> {
+): Promise<CapturedInterfaceResult[]> {
   const format = options.format || 'png';
   const quality = options.quality ?? 0.92;
   const meta = getInterfaceById(interfaceIdOrRoute);
@@ -242,86 +824,104 @@ export async function captureInterfaceById(
     throw new Error(`Unrecognized interface identifier: "${interfaceIdOrRoute}".`);
   }
 
-  // 1. If offscreen stage requester is registered, request background rendering
+  // Strategy 1: Offscreen Stage (preferred background capture)
   if (globalStageRequester) {
+    let stageHandle: StageHandle | null = null;
+    let stageElement: HTMLElement | null = null;
+
     try {
-      const stageElement = await globalStageRequester(meta.route, options.fullHeight ?? false);
-      if (stageElement) {
-        const canvas = await captureDomElement(stageElement, {
-          scale: options.scale ?? 2,
-          fullHeight: options.fullHeight ?? false,
-          format,
-          quality,
-        });
-
-        const mime = format === 'jpeg' ? 'image/jpeg' : 'image/png';
-        const dataUrl = canvas.toDataURL(mime, quality);
-        const approxBytes = Math.round((dataUrl.length * 3) / 4);
-
-        return {
-          id: meta.id,
-          name: meta.name,
-          category: meta.category,
-          route: meta.route,
-          canvas,
-          dataUrl,
-          width: canvas.width,
-          height: canvas.height,
-          sizeBytes: approxBytes,
-          formattedSize: formatByteSize(approxBytes),
-          capturedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-          format,
-          isSuccess: true,
-        };
+      const stageResponse = await globalStageRequester(meta.route, options.fullHeight ?? false);
+      if (stageResponse) {
+        if ('element' in stageResponse && typeof stageResponse.release === 'function') {
+          stageHandle = stageResponse;
+          stageElement = stageResponse.element;
+        } else if (stageResponse instanceof HTMLElement) {
+          stageElement = stageResponse;
+        }
       }
-    } catch (err: any) {
-      console.warn(`Stage rendering failed for ${meta.name}, falling back to live container lookup:`, err);
+    } catch (stageErr: any) {
+      console.warn(`Stage setup failed for "${meta.name}":`, stageErr);
+    }
+
+    if (stageElement) {
+      try {
+        return await executeElementCaptureWithPanels(stageElement, meta, options, format, quality);
+      } catch (renderErr: any) {
+        throw new Error(
+          `Screenshot generation failed for "${meta.name}": ${renderErr?.message || 'Rendering error'}`
+        );
+      } finally {
+        stageHandle?.release();
+      }
     }
   }
 
-  // 2. Fallback: Check if element exists in visited screens in DOM
+  // Strategy 2: Live DOM container lookup for mounted/visited screens
   const existingElement = document.getElementById(`screen-container-${meta.route}`);
   if (existingElement) {
     const prevVisibility = existingElement.style.visibility;
     existingElement.style.visibility = 'visible';
     try {
-      const canvas = await captureDomElement(existingElement, {
-        scale: options.scale ?? 2,
-        fullHeight: options.fullHeight ?? false,
-        format,
-        quality,
-      });
-
-      const mime = format === 'jpeg' ? 'image/jpeg' : 'image/png';
-      const dataUrl = canvas.toDataURL(mime, quality);
-      const approxBytes = Math.round((dataUrl.length * 3) / 4);
-
-      return {
-        id: meta.id,
-        name: meta.name,
-        category: meta.category,
-        route: meta.route,
-        canvas,
-        dataUrl,
-        width: canvas.width,
-        height: canvas.height,
-        sizeBytes: approxBytes,
-        formattedSize: formatByteSize(approxBytes),
-        capturedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-        format,
-        isSuccess: true,
-      };
+      return await executeElementCaptureWithPanels(existingElement, meta, options, format, quality);
+    } catch (renderErr: any) {
+      throw new Error(
+        `Live DOM capture failed for "${meta.name}": ${renderErr?.message || 'Rendering error'}`
+      );
     } finally {
       existingElement.style.visibility = prevVisibility;
     }
   }
 
-  throw new Error(`Interface "${meta.name}" could not be staged for background capture.`);
+  // Strategy 3: Direct DOM lookup for modals, overlays, or tools matching interface ID
+  if (typeof document !== 'undefined') {
+    const directElement =
+      document.getElementById(meta.id) ||
+      (meta.parent ? document.getElementById(`screen-container-${meta.parent}`) : null);
+
+    if (directElement && directElement instanceof HTMLElement) {
+      try {
+        return await executeElementCaptureWithPanels(directElement, meta, options, format, quality);
+      } catch (renderErr: any) {
+        throw new Error(
+          `Component capture failed for "${meta.name}": ${renderErr?.message || 'Rendering error'}`
+        );
+      }
+    }
+  }
+
+  throw new Error(
+    `Interface "${meta.name}" could not be staged for background capture (staging element unavailable and not currently mounted in DOM).`
+  );
+}
+
+/**
+ * Captures the currently active live interface visible on the screen.
+ * Returns the primary capture result, which contains panelResults if multi-panel layout was present.
+ */
+export async function captureLiveCurrentInterface(
+  currentScreen: ScreenId,
+  options: CaptureEngineOptions = {}
+): Promise<CapturedInterfaceResult> {
+  const results = await captureLiveInterfaceWithPanels(currentScreen, options);
+  return results[0];
+}
+
+/**
+ * Captures a specific interface in the background without navigating the user's active screen.
+ * Returns the primary capture result, which contains panelResults if multi-panel layout was present.
+ */
+export async function captureInterfaceById(
+  interfaceIdOrRoute: string,
+  options: CaptureEngineOptions = {}
+): Promise<CapturedInterfaceResult> {
+  const results = await captureInterfaceByIdWithPanels(interfaceIdOrRoute, options);
+  return results[0];
 }
 
 /**
  * Captures all registered AXON interfaces in deterministic hierarchy order.
  * Follows Requirement 15: Continues if one interface fails, reporting successes and failures at the end.
+ * Multi-panel interfaces automatically produce both full side-by-side views and individual panel captures.
  */
 export async function captureAllInterfaces(
   options: CaptureEngineOptions = {}
@@ -330,7 +930,7 @@ export async function captureAllInterfaces(
   const results: CapturedInterfaceResult[] = [];
   const failures: Array<{ name: string; route: string; error: string }> = [];
 
-  const targets = AXON_INTERFACES.filter((i) => i.isAvailable);
+  const targets = discoverAvailableInterfaces().filter((i) => i.isAvailable);
   const total = targets.length;
 
   for (let i = 0; i < total; i++) {
@@ -343,8 +943,8 @@ export async function captureAllInterfaces(
     });
 
     try {
-      const result = await captureInterfaceById(meta.id, options);
-      results.push(result);
+      const itemResults = await captureInterfaceByIdWithPanels(meta.id, options);
+      results.push(...itemResults);
     } catch (err: any) {
       console.warn(`Interface capture failed for "${meta.name}":`, err);
       failures.push({

@@ -261,18 +261,116 @@ export const AXON_INTERFACES: InterfaceMetadata[] = [
   },
 ];
 
+// Dynamic interface store for runtime discovery and future screens
+const dynamicInterfacesMap = new Map<string, InterfaceMetadata>();
+
 /**
- * Returns all registered interfaces in deterministic navigation hierarchy order.
+ * Registers an interface dynamically at runtime.
+ * Allows new screens, tools, modals, or views to be registered
+ * without editing existing source files.
+ */
+export function registerInterface(item: InterfaceMetadata): void {
+  dynamicInterfacesMap.set(item.id, item);
+}
+
+/**
+ * Unregisters a dynamically added interface.
+ */
+export function unregisterInterface(id: string): void {
+  dynamicInterfacesMap.delete(id);
+}
+
+/**
+ * Dynamically discovers all currently available interfaces in AXON:
+ * 1. Registered interfaces from authoritative registry
+ * 2. Dynamically registered interfaces
+ * 3. Screen containers currently mounted in the live DOM
+ * 4. Open modals or overlays in the live DOM
+ */
+export function discoverAvailableInterfaces(): InterfaceMetadata[] {
+  const map = new Map<string, InterfaceMetadata>();
+
+  // 1. Authoritative base interfaces
+  for (const item of AXON_INTERFACES) {
+    map.set(item.id, item);
+  }
+
+  // 2. Dynamically registered interfaces
+  for (const [id, item] of dynamicInterfacesMap.entries()) {
+    map.set(id, item);
+  }
+
+  // 3. Runtime DOM inspection for newly added or mounted screen containers
+  if (typeof document !== 'undefined') {
+    try {
+      const screenContainers = document.querySelectorAll('[id^="screen-container-"]');
+      screenContainers.forEach((container) => {
+        const idAttr = container.id;
+        const screenKey = idAttr.replace('screen-container-', '');
+        if (screenKey && !map.has(screenKey)) {
+          // Found an active screen in the DOM not yet in registry!
+          const title = screenKey
+            .split('_')
+            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+            .join(' ');
+          map.set(screenKey, {
+            id: screenKey,
+            name: title,
+            route: screenKey as ScreenId,
+            category: 'Utilities',
+            description: `Dynamically detected interface (${screenKey})`,
+            isAvailable: true,
+            isScrollable: true,
+            preferredDimensions: { width: 430, height: 932 },
+            keywords: [screenKey.toLowerCase(), title.toLowerCase()],
+          });
+        }
+      });
+
+      // 4. Check for active modals or overlays in DOM
+      const modalElements = [
+        { id: 'hamburger-drawer', name: 'Navigation Menu', keywords: ['hamburger', 'menu', 'drawer'] },
+        { id: 'project-switcher-modal', name: 'Project Switcher', keywords: ['project', 'switcher', 'projects'] },
+        { id: 'storage-onboarding-modal', name: 'Storage Onboarding', keywords: ['storage', 'onboarding'] },
+      ];
+
+      for (const m of modalElements) {
+        const el = document.getElementById(m.id);
+        if (el && !map.has(m.id)) {
+          map.set(m.id, {
+            id: m.id,
+            name: m.name,
+            route: 'axon',
+            category: 'System',
+            description: `Active interface overlay: ${m.name}`,
+            isAvailable: true,
+            isScrollable: false,
+            preferredDimensions: { width: 430, height: 932 },
+            keywords: m.keywords,
+          });
+        }
+      }
+    } catch {
+      // Non-fatal DOM read fallback
+    }
+  }
+
+  return Array.from(map.values());
+}
+
+/**
+ * Returns all available interfaces in deterministic navigation hierarchy order.
  */
 export function getAllInterfaces(): InterfaceMetadata[] {
-  return AXON_INTERFACES;
+  return discoverAvailableInterfaces();
 }
 
 /**
  * Retrieves a specific interface by ID or Route.
  */
 export function getInterfaceById(idOrRoute: string): InterfaceMetadata | undefined {
-  return AXON_INTERFACES.find((item) => item.id === idOrRoute || item.route === idOrRoute);
+  const all = discoverAvailableInterfaces();
+  return all.find((item) => item.id === idOrRoute || item.route === idOrRoute);
 }
 
 export interface InterfaceQueryResolution {
@@ -308,6 +406,8 @@ export function resolveInterfaceFromQuery(query: string, currentScreen?: ScreenI
     };
   }
 
+  const interfaces = discoverAvailableInterfaces();
+
   // Check for "Current interface" intent
   if (
     normalized.includes('current interface') ||
@@ -317,7 +417,7 @@ export function resolveInterfaceFromQuery(query: string, currentScreen?: ScreenI
     normalized.includes('where i am') ||
     normalized.includes('what i am looking at')
   ) {
-    const currentMeta = currentScreen ? getInterfaceById(currentScreen) : AXON_INTERFACES[0];
+    const currentMeta = currentScreen ? getInterfaceById(currentScreen) : interfaces[0];
     return {
       isCurrent: true,
       match: currentMeta,
@@ -327,7 +427,7 @@ export function resolveInterfaceFromQuery(query: string, currentScreen?: ScreenI
   }
 
   // Check exact ID or route
-  const exact = AXON_INTERFACES.find(
+  const exact = interfaces.find(
     (item) => item.id.toLowerCase() === normalized || item.route.toLowerCase() === normalized
   );
   if (exact) {
@@ -341,7 +441,7 @@ export function resolveInterfaceFromQuery(query: string, currentScreen?: ScreenI
   // Score matches based on name and keywords
   const scores: Array<{ item: InterfaceMetadata; score: number }> = [];
 
-  for (const item of AXON_INTERFACES) {
+  for (const item of interfaces) {
     const itemName = item.name.toLowerCase();
     let score = 0;
 
@@ -372,7 +472,7 @@ export function resolveInterfaceFromQuery(query: string, currentScreen?: ScreenI
     const candidateName = capturedNameMatch ? capturedNameMatch[1].trim() : normalized;
     return {
       isAmbiguous: true,
-      candidates: AXON_INTERFACES.slice(0, 5),
+      candidates: interfaces.slice(0, 5),
       unrecognizedName: candidateName,
     };
   }
