@@ -102,6 +102,29 @@ export function SwipeableTabContainer<T extends string>({
     return () => observer.disconnect();
   }, [currentIndex, fitHeight, syncHeight]);
 
+  // Adapt height when children change (e.g. search query or list filtering)
+  useEffect(() => {
+    if (!fitHeight) {
+      syncHeight(currentIndex);
+      const rAF = requestAnimationFrame(() => {
+        syncHeight(currentIndex);
+      });
+      return () => cancelAnimationFrame(rAF);
+    }
+  }, [children, currentIndex, fitHeight, syncHeight]);
+
+  // Window resize handler to maintain accurate container dimensions
+  useEffect(() => {
+    const handleResize = () => {
+      containerWidthRef.current = containerRef.current?.clientWidth || window.innerWidth || 360;
+      if (!fitHeight) {
+        syncHeight(currentIndex);
+      }
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [currentIndex, fitHeight, syncHeight]);
+
   // Cleanup on unmount
   useEffect(() => {
     return () => {
@@ -111,13 +134,13 @@ export function SwipeableTabContainer<T extends string>({
     };
   }, []);
 
-  const isIgnoredTarget = (target: HTMLElement | null): boolean => {
+  const isIgnoredTarget = (target: HTMLElement | null, forMouse = false): boolean => {
     if (!target) return false;
-    return Boolean(
-      target.closest(
-        'input, textarea, select, [contenteditable="true"], .no-tab-swipe, .no-swipe-gesture, [data-no-swipe]'
-      )
-    );
+    const baseSelector =
+      'input, textarea, select, [contenteditable="true"], .no-tab-swipe, .no-swipe-gesture, [data-no-swipe]';
+    const mouseSelector =
+      'input, textarea, select, button, a, [role="button"], [contenteditable="true"], .no-tab-swipe, .no-swipe-gesture, [data-no-swipe]';
+    return Boolean(target.closest(forMouse ? mouseSelector : baseSelector));
   };
 
   const handleTouchStart = (e: React.TouchEvent) => {
@@ -340,7 +363,7 @@ export function SwipeableTabContainer<T extends string>({
   const handleMouseDown = (e: React.MouseEvent) => {
     if (numTabs <= 1) return;
     if (e.button !== 0) return;
-    if (isIgnoredTarget(e.target as HTMLElement | null)) return;
+    if (isIgnoredTarget(e.target as HTMLElement | null, true)) return;
 
     containerWidthRef.current = containerRef.current?.clientWidth || window.innerWidth || 360;
     if (!fitHeight) {
