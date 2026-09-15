@@ -347,3 +347,50 @@ export function sanitizeClonedTreeForCapture(
     }
   }
 }
+
+/**
+ * Wraps a Window's getComputedStyle so that any CSS properties
+ * containing modern color functions (oklab, oklch, lab, lch, color)
+ * are seamlessly normalized to standard rgb/rgba during rendering.
+ * Returns an unwrap callback to restore the original method.
+ */
+export function wrapWindowGetComputedStyle(win: Window): () => void {
+  if (!win || !win.getComputedStyle) return () => {};
+  const orig = win.getComputedStyle;
+
+  const sanitizeValue = (val: any): any => {
+    if (typeof val === 'string' && containsModernColorFunction(val)) {
+      return replaceModernColorsInCss(val);
+    }
+    return val;
+  };
+
+  const createProxy = (decl: CSSStyleDeclaration): CSSStyleDeclaration => {
+    return new Proxy(decl, {
+      get(target, prop, receiver) {
+        if (prop === 'getPropertyValue') {
+          return (propertyName: string) => {
+            const v = target.getPropertyValue(propertyName);
+            return sanitizeValue(v);
+          };
+        }
+        const val = Reflect.get(target, prop, receiver);
+        if (typeof val === 'function') {
+          return val.bind(target);
+        }
+        return sanitizeValue(val);
+      },
+    });
+  };
+
+  win.getComputedStyle = function (elt: Element, pseudoElt?: string | null) {
+    const decl = orig.call(win, elt, pseudoElt);
+    if (!decl) return decl;
+    return createProxy(decl);
+  } as typeof win.getComputedStyle;
+
+  return () => {
+    win.getComputedStyle = orig;
+  };
+}
+

@@ -7,7 +7,7 @@ import {
   getInterfaceById,
   getSafeInterfaceFileName,
 } from './interfaceRegistry';
-import { sanitizeClonedTreeForCapture } from './colorConverter';
+import { sanitizeClonedTreeForCapture, wrapWindowGetComputedStyle } from './colorConverter';
 
 export interface GeneratedResultFile {
   id: string;
@@ -125,22 +125,40 @@ export async function captureDomElement(
     // Wait one animation frame for reflow to settle
     await new Promise((resolve) => requestAnimationFrame(resolve));
 
-    const canvas = await html2canvas(element, {
-      scale,
-      useCORS: true,
-      allowTaint: true,
-      backgroundColor: '#000000',
-      logging: false,
-      scrollX: 0,
-      scrollY: 0,
-      windowWidth: element.scrollWidth || 430,
-      windowHeight: isFull ? Math.max(element.scrollHeight, 800) : element.clientHeight || 932,
-      onclone: (clonedDoc, clonedElement) => {
-        sanitizeClonedTreeForCapture(clonedDoc, clonedElement, element);
-      },
-    });
+    let unwrapGlobal: (() => void) | null = null;
+    let unwrapCloned: (() => void) | null = null;
+    if (typeof window !== 'undefined') {
+      unwrapGlobal = wrapWindowGetComputedStyle(window);
+    }
 
-    return canvas;
+    try {
+      const canvas = await html2canvas(element, {
+        scale,
+        useCORS: true,
+        allowTaint: true,
+        backgroundColor: '#000000',
+        logging: false,
+        scrollX: 0,
+        scrollY: 0,
+        windowWidth: element.scrollWidth || 430,
+        windowHeight: isFull ? Math.max(element.scrollHeight, 800) : element.clientHeight || 932,
+        onclone: (clonedDoc, clonedElement) => {
+          if (clonedDoc.defaultView && clonedDoc.defaultView !== window) {
+            unwrapCloned = wrapWindowGetComputedStyle(clonedDoc.defaultView);
+          }
+          sanitizeClonedTreeForCapture(clonedDoc, clonedElement, element);
+        },
+      });
+
+      return canvas;
+    } finally {
+      if (unwrapCloned) {
+        unwrapCloned();
+      }
+      if (unwrapGlobal) {
+        unwrapGlobal();
+      }
+    }
   } finally {
     if (restoreStyles) {
       restoreStyles();
